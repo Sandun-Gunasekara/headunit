@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.14.1 (2026-10-09)
+
+- **USB update packages** in `mazda/usb-update/` and attached to the release: install, restore,
+  collect-logs, cleanup and HUD test, ready to unzip onto a USB stick. They update only the `headunit`
+  program (no full reinstall), keep the previous version for restoring, restore it automatically if the new
+  version doesn't start, and need no taps on the screen. See [`mazda/usb-update/README.md`](mazda/usb-update/README.md).
+  Works on firmware where USB tweaks run (tested on 56.00.511); not on 59.00.502+ / 70.xx+.
+- Popups show proper messages ("Installing Android Auto 1.14.1") instead of test-build wording, and the
+  install no longer switches debug logging on.
+- `make usb-packages` builds the zips; `test-usb-scripts.sh` tests them against a fake CMU.
+- No changes to the headunit program itself compared to 1.14.
+
 ## 1.14 (2026-10-09)
 
 Fixes for the HUD navigation display and for Android Auto not (re)connecting, found and tested in a real car.
