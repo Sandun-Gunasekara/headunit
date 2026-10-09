@@ -82,6 +82,11 @@ dbus/generated_cmu.h: dbus/cmu_interfaces.xml
 clean:
 	rm -f *~ $(TOP)/hu/generated.arm/* dbus/generated_*.* $(OBJS) $(APP) $(DEPS) $(APPLICATION_NAME)_*.zip version.h
 
+# USB stick packages for installing/restoring without the AIO installer (see usb-update/README.md)
+usb-packages: all
+	$(M3TOOLCHAIN)/bin/arm-cortexa9_neon-linux-gnueabi-strip --strip-debug -o usb-update/headunit.stripped headunit
+	usb-update/package.sh usb-update/headunit.stripped "$(shell git describe --tags)" usb-update/dist
+
 install: all
 	cp -a -f headunit installer/config/androidauto/data_persist/dev/bin/; cp -a -f headunit.json installer/config/androidauto/data_persist/dev/bin/
 release: install
@@ -89,4 +94,4 @@ release: install
 
 -include $(DEPS)
 
-.PHONY: clean
+.PHONY: clean usb-packages
