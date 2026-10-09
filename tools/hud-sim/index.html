@@ -77,6 +77,7 @@
       <h2>Simulate car conditions</h2>
       <label><input type="checkbox" id="installed"> HUD service reports installed</label>
       <label><input type="checkbox" id="ignore"> HUD ignores a message that repeats the last counter</label>
+      <label><input type="checkbox" id="msg2"> Firmware has SetHUD_Display_Msg2 (street names; 56.00.511 doesn't)</label>
       <div class="btns">
         <button data-fail="1">Fail next HUD call</button>
         <button data-fail="5">Fail next 5 calls</button>
@@ -119,6 +120,7 @@ function render(s) {
   $('hud').classList.toggle('stale', s.seconds_since_call !== null && s.seconds_since_call > 5);
   $('installed').checked = s.installed;
   $('ignore').checked = s.ignore_same_counter;
+  $('msg2').checked = s.msg2_supported;
   $('pending').textContent = s.fail_next;
   $('s-display').textContent = s.stats.display_calls;
   $('s-ignored').textContent = s.stats.ignored;
@@ -152,6 +154,7 @@ async function poll() {
 
 $('installed').onchange = e => control({installed: e.target.checked});
 $('ignore').onchange = e => control({ignore_same_counter: e.target.checked});
+$('msg2').onchange = e => control({msg2_supported: e.target.checked});
 $('clear').onclick = () => control({clear_log: true});
 document.querySelectorAll('[data-fail]').forEach(b => b.onclick = () => control({fail_next: Number(b.dataset.fail)}));
 poll();

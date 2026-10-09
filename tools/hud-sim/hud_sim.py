@@ -64,6 +64,7 @@ class HudState:
         self.installed = True
         self.fail_next = 0
         self.ignore_same_counter = True
+        self.msg2_supported = True
         self.display = {'icon': 0, 'distance': 0, 'unit': 1, 'counter': 0, 'text': '', 'updated': None}
         self.last_counter = None
         self.stats = {'display_calls': 0, 'text_calls': 0, 'ignored': 0, 'failed': 0, 'installed_calls': 0}
@@ -84,6 +85,7 @@ class HudState:
                 'installed': self.installed,
                 'fail_next': self.fail_next,
                 'ignore_same_counter': self.ignore_same_counter,
+                'msg2_supported': self.msg2_supported,
                 'display': d,
                 'stats': dict(self.stats),
                 'seconds_since_call': None if self.last_call is None else round(time.time() - self.last_call, 1),
@@ -138,6 +140,13 @@ class VbsNavi(dbus.service.Object):
     def SetHUD_Display_Msg2(self, msg):
         text, counter = str(msg[0]), int(msg[1])
         with STATE.lock:
+            if not STATE.msg2_supported:
+                # Like CMU firmware 56.00.511, which doesn't have this method
+                STATE.stats['text_calls'] += 1
+                STATE.add_log('FAILED', 'SetHUD_Display_Msg2: UnknownMethod (firmware without street names)')
+                raise dbus.exceptions.DBusException(
+                    'Method "SetHUD_Display_Msg2" with signature "(sy)" on interface "com.jci.vbs.navi.tmc" doesn\'t exist',
+                    name='org.freedesktop.DBus.Error.UnknownMethod')
             STATE.last_call = time.time()
             STATE.stats['text_calls'] += 1
             self._maybe_fail('SetHUD_Display_Msg2')
@@ -189,6 +198,9 @@ class Handler(BaseHTTPRequestHandler):
             if 'ignore_same_counter' in body:
                 STATE.ignore_same_counter = bool(body['ignore_same_counter'])
                 STATE.add_log('control', 'ignore repeated counter = %s' % STATE.ignore_same_counter)
+            if 'msg2_supported' in body:
+                STATE.msg2_supported = bool(body['msg2_supported'])
+                STATE.add_log('control', 'SetHUD_Display_Msg2 supported = %s' % STATE.msg2_supported)
             if body.get('clear_log'):
                 STATE.log = []
         self._send(200, json.dumps(STATE.snapshot()).encode(), 'application/json')
@@ -216,8 +228,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--port', type=int, default=6081)
     parser.add_argument('--workdir', default='/tmp')
+    parser.add_argument('--no-msg2', action='store_true',
+                        help="behave like CMU firmware without SetHUD_Display_Msg2 (e.g. 56.00.511)")
     args = parser.parse_args()
 
+    STATE.msg2_supported = not args.no_msg2
     buses = [start_bus(SERVICE_SOCKET, args.workdir), start_bus(HMI_SOCKET, args.workdir)]
 
     DBusGMainLoop(set_as_default=True)
