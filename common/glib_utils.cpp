@@ -1,4 +1,5 @@
 #include "glib_utils.h"
+#include <stdio.h>
 
 GMainContext* run_on_thread_main_context = nullptr;
 
@@ -26,4 +27,20 @@ void run_on_main_thread_delay(guint milliseconds, std::function<bool()>&& f)
 
     g_source_attach(source, run_on_thread_main_context);
     g_source_unref(source);
+}
+
+void quit_main_loop_async(GMainLoop* loop)
+{
+    if (!loop)
+    {
+        printf("quit_main_loop_async: no main loop\n");
+        return;
+    }
+    // Keep it alive until the quit runs, so a later loop can't reuse its address
+    g_main_loop_ref(loop);
+    run_on_main_thread([loop](){
+        g_main_loop_quit(loop);
+        g_main_loop_unref(loop);
+        return false;
+    });
 }

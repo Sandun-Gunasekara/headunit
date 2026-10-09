@@ -7,7 +7,7 @@ hud_logic_test: hud_logic_test.cpp ../hud_logic.cpp ../hud_logic.h
 
 # Scripted drive through the real HUD thread into tools/hud-sim (needs dbus-c++ and the generated dbus proxies)
 hud_replay: hud_replay.cpp ../hud.cpp ../hud_logic.cpp ../hud.h ../hud_logic.h ../../dbus/generated_cmu.h
-	$(CXX) $(CXXFLAGS) -pthread -I../../../hu -o $@ hud_replay.cpp ../hud.cpp ../hud_logic.cpp \
+	$(CXX) $(CXXFLAGS) -pthread -I../../../hu -I../../../common -o $@ hud_replay.cpp ../hud.cpp ../hud_logic.cpp \
 		$(shell pkg-config --cflags --libs dbus-c++-1)
 
 ../../dbus/generated_cmu.h: ../../dbus/cmu_interfaces.xml

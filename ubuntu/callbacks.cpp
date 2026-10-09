@@ -54,7 +54,7 @@ void DesktopEventCallbacks::MediaSetupComplete(int chan) {
 
 void DesktopEventCallbacks::DisconnectionOrError() {
     printf("DisconnectionOrError\n");
-    g_main_loop_quit(gst_app.loop);
+    quit_main_loop_async(gst_app.loop);
 }
 
 void DesktopEventCallbacks::CustomizeOutputChannel(int chan, HU::ChannelDescriptor::OutputStreamChannel &streamChannel) {

@@ -3,6 +3,7 @@
 #include <dbus/dbus.h>
 #include <dbus-c++/dbus.h>
 #include <stdint.h>
+#include <string.h>
 #include <string>
 #include <functional>
 #include <condition_variable>
@@ -26,48 +27,87 @@ static TMCClient *tmc_client = NULL;
 
 NaviData navi_data;
 
-static bool hud_send(const NaviData& data)
+// Not every CMU firmware has SetHUD_Display_Msg2 (56.00.511 answers UnknownMethod). The arrow and
+// distance from SetHUDDisplayMsgReq work without it, so stop calling it rather than treating every
+// update as failed.
+static bool msg2_supported = true;
+
+bool hud_send_raw(uint32_t icon, uint16_t distance, uint8_t unit, uint8_t counter, const std::string& text)
 {
   ::DBus::Struct< uint32_t, uint16_t, uint8_t, uint16_t, uint8_t, uint8_t > hudDisplayMsg;
-  hudDisplayMsg._1 = hud_turn_icon(data.turn_event, data.turn_side, data.turn_angle);
-  hudDisplayMsg._2 = data.distance;
-  hudDisplayMsg._3 = data.distance_unit;
+  hudDisplayMsg._1 = icon;
+  hudDisplayMsg._2 = distance;
+  hudDisplayMsg._3 = unit;
   hudDisplayMsg._4 = 0; //Speed limit (Not Used)
   hudDisplayMsg._5 = 0; //Speed limit units (Not used)
-  hudDisplayMsg._6 = data.previous_msg;
+  hudDisplayMsg._6 = counter;
 
-  ::DBus::Struct< std::string, uint8_t > guidancePointData;
-  guidancePointData._1 = data.event_name;
-  guidancePointData._2 = data.previous_msg;
+  // Log what the HUD is told whenever it changes (not for counter-only resends)
+  static uint32_t last_icon = 0xFFFFFFFF;
+  static uint16_t last_distance = 0;
+  static uint8_t last_unit = 0;
+  static std::string last_text;
+  if (icon != last_icon || distance != last_distance || unit != last_unit || text != last_text)
+  {
+    logw("HUD: icon %u distance %u unit %u counter %u '%s'", icon, distance, unit, counter, text.c_str());
+    last_icon = icon;
+    last_distance = distance;
+    last_unit = unit;
+    last_text = text;
+  }
 
-  logd("HUD send: icon %u distance %u unit %u msg %u '%s'", hudDisplayMsg._1, hudDisplayMsg._2,
-       hudDisplayMsg._3, hudDisplayMsg._6, data.event_name.c_str());
   try
   {
     vbsnavi_client->SetHUDDisplayMsgReq(hudDisplayMsg);
-    tmc_client->SetHUD_Display_Msg2(guidancePointData);
   }
   catch(DBus::Error& error)
   {
     loge("DBUS: hud_send failed %s: %s\n", error.name(), error.message());
     return false;
   }
+
+  if (msg2_supported)
+  {
+    ::DBus::Struct< std::string, uint8_t > guidancePointData;
+    guidancePointData._1 = text;
+    guidancePointData._2 = counter;
+    try
+    {
+      tmc_client->SetHUD_Display_Msg2(guidancePointData);
+    }
+    catch(DBus::Error& error)
+    {
+      if (strcmp(error.name(), "org.freedesktop.DBus.Error.UnknownMethod") == 0)
+      {
+        logw("HUD: this CMU has no SetHUD_Display_Msg2, street names won't be shown on the HUD");
+        msg2_supported = false;
+      }
+      else
+      {
+        // Only the street name was lost, the arrow and distance were delivered
+        loge("DBUS: SetHUD_Display_Msg2 failed %s: %s\n", error.name(), error.message());
+      }
+    }
+  }
   return true;
 }
 
-void hud_thread_func(std::condition_variable& quitcv, std::mutex& quitmutex){
+static bool hud_send(const NaviData& data)
+{
+  return hud_send_raw(hud_turn_icon(data.turn_event, data.turn_side, data.turn_angle), data.distance,
+                      data.distance_unit, data.previous_msg, data.event_name);
+}
+
+void hud_thread_func(QuitSignal& quit){
   // Keep running for the whole AA session: a failed dbus call or the HUD service not being
   // ready yet must not stop HUD updates until the phone reconnects.
   bool was_installed = true;
   bool showing_guidance = false;
   while (true)
   {
+    if (quit.wait_for(std::chrono::milliseconds(1000)))
     {
-        std::unique_lock<std::mutex> lk(quitmutex);
-        if (quitcv.wait_for(lk, std::chrono::milliseconds(1000)) == std::cv_status::no_timeout)
-        {
-            break;
-        }
+      break;
     }
 
     bool installed = hud_installed();
@@ -84,6 +124,7 @@ void hud_thread_func(std::condition_variable& quitcv, std::mutex& quitmutex){
     NaviData snapshot;
     {
       std::lock_guard<std::mutex> lock(hudmutex);
+      // Only send changes: the HUD keeps showing the last message until it gets a new one
       if (!navi_data.changed)
       {
         continue;

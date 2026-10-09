@@ -46,7 +46,6 @@ gst_loop(gst_app_t *app) {
         int ret;
         GstStateChangeReturn state_ret;
 
-        app->loop = g_main_loop_new(NULL, FALSE);
         printf("Starting Android Auto...\n");
         g_main_loop_run(app->loop);
 
@@ -113,6 +112,9 @@ main(int argc, char *argv[]) {
             DesktopEventCallbacks callbacks;
             HUServer headunit(callbacks);
 
+            // Create the loop before connecting so an early disconnect can quit it
+            app->loop = g_main_loop_new(NULL, FALSE);
+
             /* Start AA processing */
             ret = headunit.hu_aap_start(config::transport_type, config::phoneIpAddress, true);
             if (ret < 0) {
@@ -124,9 +126,8 @@ main(int argc, char *argv[]) {
 
 #ifdef HUD_SIM
             hud_start();
-            std::condition_variable hudQuitCv;
-            std::mutex hudQuitMutex;
-            std::thread hudThread([&hudQuitCv, &hudQuitMutex](){ hud_thread_func(hudQuitCv, hudQuitMutex); });
+            QuitSignal hudQuit;
+            std::thread hudThread([&hudQuit](){ hud_thread_func(hudQuit); });
 #endif
 
             g_hu = &headunit.GetAnyThreadInterface();
@@ -140,7 +141,7 @@ main(int argc, char *argv[]) {
 
             callbacks.connected = false;
 #ifdef HUD_SIM
-            hudQuitCv.notify_all();
+            hudQuit.request();
             hudThread.join();
 #endif
             commandCallbacks.eventCallbacks = nullptr;
@@ -154,6 +155,8 @@ main(int argc, char *argv[]) {
             }
 
             g_hu = nullptr;
+            g_main_loop_unref(app->loop);
+            app->loop = nullptr;
         }
 
         SDL_Quit();

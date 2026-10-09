@@ -1,8 +1,10 @@
 // Plays a scripted drive through the real HUD thread (mazda/hud/hud.cpp) into the HUD simulator
 // (tools/hud-sim), so turns and distance countdowns can be checked without driving.
-//   make -C mazda/hud/test hud_replay && ./mazda/hud/test/hud_replay [seconds per update]
+//   make -C mazda/hud/test hud_replay && ./mazda/hud/test/hud_replay [seconds per update] [disconnect]
+// "disconnect" ends the drive like a phone dropping mid-route (no navigation stop message).
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <condition_variable>
 #include <thread>
 #include <dbus-c++/dbus.h>
@@ -55,6 +57,7 @@ int main(int argc, char* argv[])
 {
     if (argc > 1)
         step_ms = (int)(atof(argv[1]) * 1000);
+    bool disconnect = argc > 2 && strcmp(argv[2], "disconnect") == 0;
 
     DBus::_init_threading();
     DBus::BusDispatcher dispatcher;
@@ -66,9 +69,8 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    std::condition_variable quitcv;
-    std::mutex quitmutex;
-    std::thread hud_thread([&quitcv, &quitmutex](){ hud_thread_func(quitcv, quitmutex); });
+    QuitSignal quit;
+    std::thread hud_thread([&quit](){ hud_thread_func(quit); });
 
     turn("Head south on Galwarusa Rd", SIDE_UNSPECIFIED, EV_DEPART);
     drive(300, 200, 50);
@@ -80,15 +82,20 @@ int main(int argc, char* argv[])
     turn("At the roundabout, take the 2nd exit", SIDE_RIGHT, EV_ROUNDABOUT_ENTER_AND_EXIT, 2, 90);
     drive(400, 0, 100);
     turn("Destination will be on the right", SIDE_RIGHT, EV_DESTINATION);
-    drive(100, 0, 50);
-    printf("navigation stopped\n");
-    {
-        std::lock_guard<std::mutex> lock(hudmutex);
-        navi_apply_stop(navi_data);
+    if (disconnect) {
+        drive(100, 50, 50);
+        printf("phone disconnected mid-route\n");
+    } else {
+        drive(100, 0, 50);
+        printf("navigation stopped\n");
+        {
+            std::lock_guard<std::mutex> lock(hudmutex);
+            navi_apply_stop(navi_data);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
 
-    quitcv.notify_all();
+    quit.request();
     hud_thread.join();
     return 0;
 }

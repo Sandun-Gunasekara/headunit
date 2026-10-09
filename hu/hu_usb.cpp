@@ -3,6 +3,12 @@
 #include "hu_usb.h"
 #include <vector>
 #include <algorithm>
+#include <chrono>
+#include <string.h>
+#include <sys/select.h>
+#include <dirent.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 
 #include <libusb.h>
@@ -132,7 +138,146 @@ static int iusb_control_transfer (libusb_device_handle * usb_hndl, uint8_t req_t
   return (0);
 }
 
+// Watches udev for USB devices being added
+class UsbAddMonitor
+{
+  struct udev* udev_ctx = nullptr;
+  struct udev_monitor* mon = nullptr;
+public:
+  UsbAddMonitor()
+  {
+    udev_ctx = udev_new();
+    if (udev_ctx)
+      mon = udev_monitor_new_from_netlink(udev_ctx, "udev");
+    if (!mon)
+    {
+      loge("udev monitor unavailable, falling back to rescanning");
+      return;
+    }
+    if (udev_monitor_filter_add_match_subsystem_devtype(mon, "usb", "usb_device") != 0 ||
+        udev_monitor_enable_receiving(mon) != 0)
+    {
+      loge("udev monitor setup failed, falling back to rescanning");
+      udev_monitor_unref(mon);
+      mon = nullptr;
+    }
+  }
+  ~UsbAddMonitor()
+  {
+    if (mon)
+      udev_monitor_unref(mon);
+    if (udev_ctx)
+      udev_unref(udev_ctx);
+  }
+
+  // Returns true if a USB device was added within timeout_ms
+  bool wait_for_add(int timeout_ms)
+  {
+    if (!mon)
+    {
+      ms_sleep(timeout_ms);
+      return false;
+    }
+    int fd = udev_monitor_get_fd(mon);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (true)
+    {
+      long left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+      if (left <= 0)
+        return false;
+
+      fd_set fds;
+      FD_ZERO(&fds);
+      FD_SET(fd, &fds);
+      timeval tv;
+      tv.tv_sec = left / 1000;
+      tv.tv_usec = (left % 1000) * 1000;
+      int ret = select(fd + 1, &fds, NULL, NULL, &tv);
+      if (ret < 0)
+      {
+        if (errno == EINTR)
+          continue;
+        loge("udev select failed errno: %d (%s)", errno, strerror(errno));
+        ms_sleep(left);
+        return false;
+      }
+      if (ret == 0)
+        return false;
+
+      struct udev_device* dev = udev_monitor_receive_device(mon);
+      if (!dev)
+        continue;
+      const char* action = udev_device_get_action(dev);
+      logw("udev device %sed | node:%s", action ? action : "?", udev_device_get_devnode(dev) ? udev_device_get_devnode(dev) : "?");
+      bool added = action && strcmp(action, "add") == 0;
+      udev_device_unref(dev);
+      if (added)
+        return true;
+    }
+  }
+};
+
 //based on http://source.android.com/devices/accessories/aoa.html
+// Asks a device to switch to Android accessory mode. Returns true if it accepted.
+bool HUTransportStreamUSB::switch_to_accessory_mode(libusb_device* device, bool verbose)
+{
+    libusb_device_descriptor desc;
+    if (libusb_get_device_descriptor(device, &desc) < 0)
+    {
+        loge("Error getting descriptor");
+        return false;
+    }
+    if (desc.idVendor == VEN_ID_GOOGLE && (desc.idProduct == DEV_ID_OAP || desc.idProduct == DEV_ID_OAP_WITH_ADB))
+    {
+        // Already in accessory mode (find_oap_device couldn't open it yet), don't restart it
+        return false;
+    }
+    if (verbose)
+        logw("Opening device 0x%04x : 0x%04x", desc.idVendor, desc.idProduct);
+    libusb_device_handle* handle = nullptr;
+    if (libusb_open(device, &handle) < 0)
+    {
+        if (verbose)
+            loge("Error opening device 0x%04x : 0x%04x", desc.idVendor, desc.idProduct);
+        return false;
+    }
+
+    bool started = false;
+    uint16_t oap_proto_ver = 0;
+    if (iusb_control_transfer(handle, USB_DIR_IN | USB_TYPE_VENDOR, ACC_REQ_GET_PROTOCOL, 0, 0, (byte*)&oap_proto_ver, sizeof(uint16_t), 1000) >= 0
+        && le16toh(oap_proto_ver) >= 1)
+    {
+        oap_proto_ver = le16toh(oap_proto_ver);
+        logw("Device 0x%04x : 0x%04x responded with protocol ver %u", desc.idVendor, desc.idProduct, oap_proto_ver);
+        struct { int idx; unsigned char* val; size_t len; const char* name; } strings[] = {
+            { ACC_IDX_MAN, AAP_VAL_MAN, sizeof(AAP_VAL_MAN), "ACC_IDX_MAN" },
+            { ACC_IDX_MOD, AAP_VAL_MOD, sizeof(AAP_VAL_MOD), "ACC_IDX_MOD" },
+            { ACC_IDX_DESC, AAP_VAL_DESC, sizeof(AAP_VAL_DESC), "ACC_IDX_DESC" },
+            { ACC_IDX_VER, AAP_VAL_VER, sizeof(AAP_VAL_VER), "ACC_IDX_VER" },
+            { ACC_IDX_URI, AAP_VAL_URI, sizeof(AAP_VAL_URI), "ACC_IDX_URI" },
+            { ACC_IDX_SERIAL, AAP_VAL_SERIAL, sizeof(AAP_VAL_SERIAL), "ACC_IDX_SERIAL" },
+        };
+        started = true;
+        for (auto& str : strings)
+        {
+            if (iusb_control_transfer(handle, USB_DIR_OUT | USB_TYPE_VENDOR, ACC_REQ_SEND_STRING, 0, str.idx, str.val, str.len, 1000) < 0)
+            {
+                loge("Error sending %s to device 0x%04x : 0x%04x", str.name, desc.idVendor, desc.idProduct);
+                started = false;
+                break;
+            }
+        }
+        if (started && iusb_control_transfer(handle, USB_DIR_OUT | USB_TYPE_VENDOR, ACC_REQ_START, 0, 0, nullptr, 0, 1000) < 0)
+        {
+            loge("Error sending ACC_REQ_START to device 0x%04x : 0x%04x", desc.idVendor, desc.idProduct);
+            started = false;
+        }
+    }
+
+    libusb_close(handle);
+    return started;
+}
+
 libusb_device_handle* HUTransportStreamUSB::find_oap_device()
 {
     libusb_device_handle* handle = libusb_open_device_with_vid_pid(iusb_ctx, VEN_ID_GOOGLE, DEV_ID_OAP);
@@ -338,6 +483,140 @@ int HUTransportStreamUSB::start_usb_recv()
     return iusb_state;
 }
 
+// ---- Adaptor recovery -------------------------------------------------------------------------
+// Some wireless AA adaptors drop off USB when the phone goes out of range and never come back by
+// themselves; only unplugging them helps. We remember which hub port the AA device was on, and if
+// that port is still empty a while after a session ended, switch the port's power off and on again
+// (the same as replugging). Only that one port is touched, only while nothing is connected to it,
+// and only on hubs that can switch ports individually.
+
+struct AdaptorPort
+{
+  std::string hub;   // sysfs name of the hub, e.g. "2-1" or "usb2" for a root hub
+  int port = 0;      // port number on that hub
+};
+static AdaptorPort adaptor_port;
+
+static bool read_sysfs_int(const std::string& path, int& value)
+{
+  FILE* f = fopen(path.c_str(), "r");
+  if (!f)
+    return false;
+  bool ok = fscanf(f, "%d", &value) == 1;
+  fclose(f);
+  return ok;
+}
+
+// Finds the sysfs name ("2-1.2") of the USB device with this bus number and address
+static std::string sysfs_name_of(int bus, int address)
+{
+  DIR* dir = opendir("/sys/bus/usb/devices");
+  if (!dir)
+    return "";
+  std::string found;
+  while (struct dirent* entry = readdir(dir))
+  {
+    std::string name = entry->d_name;
+    if (name[0] == '.' || name.find(':') != std::string::npos)   // skip interfaces like "2-1.2:1.0"
+      continue;
+    int b = 0, d = 0;
+    if (read_sysfs_int("/sys/bus/usb/devices/" + name + "/busnum", b) &&
+        read_sysfs_int("/sys/bus/usb/devices/" + name + "/devnum", d) && b == bus && d == address)
+    {
+      found = name;
+      break;
+    }
+  }
+  closedir(dir);
+  return found;
+}
+
+// "2-1.2" -> hub "2-1" port 2; "2-1" -> root hub "usb2" port 1
+static bool split_port_path(const std::string& name, AdaptorPort& out)
+{
+  size_t sep = name.find_last_of(".-");
+  if (name.empty() || sep == std::string::npos || sep + 1 >= name.size())
+    return false;
+  out.port = atoi(name.c_str() + sep + 1);
+  out.hub = name[sep] == '.' ? name.substr(0, sep) : "usb" + name.substr(0, sep);
+  return out.port > 0;
+}
+
+static void remember_adaptor_port(libusb_device* device)
+{
+  std::string name = sysfs_name_of(libusb_get_bus_number(device), libusb_get_device_address(device));
+  AdaptorPort found;
+  if (!split_port_path(name, found))
+    return;
+  if (found.hub != adaptor_port.hub || found.port != adaptor_port.port)
+    logw("AA device is on USB %s port %d", found.hub.c_str(), found.port);
+  adaptor_port = found;
+}
+
+static libusb_device_handle* open_hub(libusb_context* ctx, const std::string& hub)
+{
+  int bus = 0, address = 0;
+  if (!read_sysfs_int("/sys/bus/usb/devices/" + hub + "/busnum", bus) ||
+      !read_sysfs_int("/sys/bus/usb/devices/" + hub + "/devnum", address))
+    return nullptr;
+  libusb_device** devices = nullptr;
+  ssize_t count = libusb_get_device_list(ctx, &devices);
+  libusb_device_handle* handle = nullptr;
+  for (ssize_t i = 0; i < count; i++)
+  {
+    if (libusb_get_bus_number(devices[i]) == bus && libusb_get_device_address(devices[i]) == address)
+    {
+      if (libusb_open(devices[i], &handle) < 0)
+        handle = nullptr;
+      break;
+    }
+  }
+  if (count >= 0)
+    libusb_free_device_list(devices, 1);
+  return handle;
+}
+
+// Power-cycles the adaptor's port if it is empty. Returns true if it did.
+static bool power_cycle_adaptor_port(libusb_context* ctx)
+{
+  const uint8_t to_hub = 0xA0, from_port = 0xA3, to_port = 0x23;
+  const uint16_t PORT_POWER = 8;
+  libusb_device_handle* hub = open_hub(ctx, adaptor_port.hub);
+  if (!hub)
+  {
+    loge("Adaptor recovery: can't open hub %s", adaptor_port.hub.c_str());
+    return false;
+  }
+  bool cycled = false;
+  unsigned char hub_desc[16] = {0};
+  unsigned char status[4] = {0};
+  if (libusb_control_transfer(hub, to_hub, LIBUSB_REQUEST_GET_DESCRIPTOR, 0x29 << 8, 0, hub_desc, sizeof(hub_desc), 1000) < 5 ||
+      (hub_desc[3] & 3) != 1)
+  {
+    logw("Adaptor recovery: hub %s can't switch ports individually, not touching it", adaptor_port.hub.c_str());
+  }
+  else if (libusb_control_transfer(hub, from_port, LIBUSB_REQUEST_GET_STATUS, 0, adaptor_port.port, status, 4, 1000) != 4)
+  {
+    loge("Adaptor recovery: can't read hub %s port %d status", adaptor_port.hub.c_str(), adaptor_port.port);
+  }
+  else if (status[0] & 0x01)
+  {
+    logw("Adaptor recovery: something is connected to hub %s port %d, leaving it alone", adaptor_port.hub.c_str(), adaptor_port.port);
+  }
+  else
+  {
+    logw("Adaptor recovery: hub %s port %d is empty, switching its power off and on", adaptor_port.hub.c_str(), adaptor_port.port);
+    libusb_control_transfer(hub, to_port, LIBUSB_REQUEST_CLEAR_FEATURE, PORT_POWER, adaptor_port.port, nullptr, 0, 1000);
+    ms_sleep(2000);
+    int ret = libusb_control_transfer(hub, to_port, LIBUSB_REQUEST_SET_FEATURE, PORT_POWER, adaptor_port.port, nullptr, 0, 1000);
+    if (ret < 0)
+      loge("Adaptor recovery: switching hub %s port %d back on failed: %d", adaptor_port.hub.c_str(), adaptor_port.port, ret);
+    cycled = true;
+  }
+  libusb_close(hub);
+  return cycled;
+}
+
 int HUTransportStreamUSB::Start(bool waitForDevice) {
 
   if (iusb_state == hu_STATE_STARTED) {
@@ -357,9 +636,21 @@ int HUTransportStreamUSB::Start(bool waitForDevice) {
 
   libusb_set_debug(iusb_ctx, LIBUSB_LOG_LEVEL_INFO);
 
+  // Listen for USB devices being added before scanning, so a device that (re)appears while
+  // we scan, e.g. a phone switching to accessory mode after ACC_REQ_START, can't be missed.
+  UsbAddMonitor usb_monitor;
+  bool verbose = true;
+  bool logged_waiting = false;
+  // Adaptor recovery (see power_cycle_adaptor_port): first try 30 s after the session ended, then
+  // every 2 minutes, at most 10 times
+  auto waiting_since = std::chrono::steady_clock::now();
+  auto next_recovery = waiting_since + std::chrono::seconds(30);
+  int recovery_attempts = 0;
+
   //See if there is a OAP device already
   while ((iusb_dev_hndl = find_oap_device()) == nullptr)
   {
+    logd("Scanning USB devices");
     libusb_device** devices = nullptr;
     ssize_t dev_count = libusb_get_device_list(iusb_ctx, &devices);
     if (dev_count < 0)
@@ -372,78 +663,7 @@ int HUTransportStreamUSB::Start(bool waitForDevice) {
     bool tried_any = false;
     for (ssize_t i = 0; i < dev_count && !tried_any; i++)
     {
-        libusb_device_descriptor desc;
-        int usb_err = libusb_get_device_descriptor(devices[i], &desc);
-        if (usb_err < 0)
-        {
-            loge("Error getting descriptor");
-            continue;
-        }
-        logw("Opening device 0x%04x : 0x%04x", desc.idVendor, desc.idProduct);
-        libusb_device_handle* handle = nullptr;
-        usb_err = libusb_open(devices[i], &handle);
-        if (usb_err < 0)
-        {
-            loge("Error opening device 0x%04x : 0x%04x", desc.idVendor, desc.idProduct);
-            continue;
-        }
-
-        uint16_t oap_proto_ver = 0;
-        if (iusb_control_transfer(handle, USB_DIR_IN | USB_TYPE_VENDOR, ACC_REQ_GET_PROTOCOL, 0, 0, (byte*)&oap_proto_ver, sizeof(uint16_t), 1000) >= 0)
-        {
-            oap_proto_ver = le16toh(oap_proto_ver);
-            if (oap_proto_ver < 1)
-            {
-                continue;
-            }
-            logw("Device 0x%04x : 0x%04x responded with protocol ver %u", desc.idVendor, desc.idProduct, oap_proto_ver);
-            usb_err = iusb_control_transfer(handle, USB_DIR_OUT | USB_TYPE_VENDOR, ACC_REQ_SEND_STRING, 0, ACC_IDX_MAN, AAP_VAL_MAN, sizeof(AAP_VAL_MAN), 1000);
-            if (usb_err < 0)
-            {
-                loge("Error sending ACC_IDX_MAN to device 0x%04x : 0x%04x", desc.idVendor, desc.idProduct);
-                continue;
-            }
-            usb_err = iusb_control_transfer(handle, USB_DIR_OUT | USB_TYPE_VENDOR, ACC_REQ_SEND_STRING, 0, ACC_IDX_MOD, AAP_VAL_MOD, sizeof(AAP_VAL_MOD), 1000);
-            if (usb_err < 0)
-            {
-                loge("Error sending ACC_IDX_MOD to device 0x%04x : 0x%04x", desc.idVendor, desc.idProduct);
-                continue;
-            }
-            usb_err = iusb_control_transfer(handle, USB_DIR_OUT | USB_TYPE_VENDOR, ACC_REQ_SEND_STRING, 0, ACC_IDX_DESC, AAP_VAL_DESC, sizeof(AAP_VAL_DESC), 1000);
-            if (usb_err < 0)
-            {
-                loge("Error sending ACC_IDX_DESC to device 0x%04x : 0x%04x", desc.idVendor, desc.idProduct);
-                continue;
-            }
-            usb_err = iusb_control_transfer(handle, USB_DIR_OUT | USB_TYPE_VENDOR, ACC_REQ_SEND_STRING, 0, ACC_IDX_VER, AAP_VAL_VER, sizeof(AAP_VAL_VER), 1000);
-            if (usb_err < 0)
-            {
-                loge("Error sending ACC_IDX_VER to device 0x%04x : 0x%04x", desc.idVendor, desc.idProduct);
-                continue;
-            }
-            usb_err = iusb_control_transfer(handle, USB_DIR_OUT | USB_TYPE_VENDOR, ACC_REQ_SEND_STRING, 0, ACC_IDX_URI, AAP_VAL_URI, sizeof(AAP_VAL_URI), 1000);
-            if (usb_err < 0)
-            {
-                loge("Error sending ACC_IDX_URI to device 0x%04x : 0x%04x", desc.idVendor, desc.idProduct);
-                continue;
-            }
-            usb_err = iusb_control_transfer(handle, USB_DIR_OUT | USB_TYPE_VENDOR, ACC_REQ_SEND_STRING, 0, ACC_IDX_SERIAL, AAP_VAL_SERIAL, sizeof(AAP_VAL_SERIAL), 1000);
-            if (usb_err < 0)
-            {
-                loge("Error sending ACC_IDX_SERIAL to device 0x%04x : 0x%04x", desc.idVendor, desc.idProduct);
-                continue;
-            }
-            usb_err = iusb_control_transfer(handle, USB_DIR_OUT | USB_TYPE_VENDOR, ACC_REQ_START, 0, 0, nullptr, 0, 1000);
-            if (usb_err < 0)
-            {
-                loge("Error sending ACC_REQ_START to device 0x%04x : 0x%04x", desc.idVendor, desc.idProduct);
-                continue;
-            }
-
-            tried_any = true;
-        }
-
-        libusb_close(handle);
+        tried_any = switch_to_accessory_mode(devices[i], verbose);
     }
 
     //unref the devices
@@ -454,17 +674,31 @@ int HUTransportStreamUSB::Start(bool waitForDevice) {
         //Try right away just incase
         if ((iusb_dev_hndl = find_oap_device()) == nullptr)
         {
-            logw("Wating for the device to reconnect");
-            //Give it some time to reconnect
-            wait_for_device_connection();
+            logw("Waiting for the device to reconnect in accessory mode");
+            //Give it some time to reconnect, then scan again even if we saw nothing
+            usb_monitor.wait_for_add(5000);
+            verbose = true;
         }
     }
     else
     {
         if (waitForDevice)
         {
-            logw("Nothing found, waiting");
-            wait_for_device_connection();
+            // A phone (or AA dongle) can be plugged in but not answer yet, e.g. while it or the
+            // CMU is still starting up. It won't be plugged in again, so keep rescanning.
+            if (!logged_waiting)
+            {
+                logw("Nothing found, waiting (rescanning every 2s)");
+                logged_waiting = true;
+            }
+            verbose = usb_monitor.wait_for_add(2000);
+            if (!verbose && adaptor_port.port > 0 && recovery_attempts < 10 &&
+                std::chrono::steady_clock::now() >= next_recovery)
+            {
+                recovery_attempts++;
+                power_cycle_adaptor_port(iusb_ctx);
+                next_recovery = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+            }
         }
         else
         {
@@ -476,8 +710,15 @@ int HUTransportStreamUSB::Start(bool waitForDevice) {
   }
 
   logw("Found OAP Device");
+  remember_adaptor_port(libusb_get_device(iusb_dev_hndl));
 
+  // Right after a device reappears in accessory mode its interface may not exist yet
+  // (LIBUSB_ERROR_NOT_FOUND); give it a moment instead of tearing the whole session down.
   int usb_err = libusb_claim_interface (iusb_dev_hndl, 0);
+  for (int attempt = 0; usb_err == LIBUSB_ERROR_NOT_FOUND && attempt < 10; attempt++) {
+    ms_sleep (100);
+    usb_err = libusb_claim_interface (iusb_dev_hndl, 0);
+  }
   if (usb_err) {
     loge ("Error libusb_claim_interface usb_err: %d (%s)", usb_err, iusb_error_get (usb_err));
     Stop();
@@ -629,4 +870,66 @@ void HUTransportStreamUSB::libusb_callback_pollfd_removed(int fd)
 void HUTransportStreamUSB::libusb_callback_pollfd_removed_tramp(int fd, void* user_data)
 {
     reinterpret_cast<HUTransportStreamUSB*>(user_data)->libusb_callback_pollfd_removed(fd);
+}
+
+// Prints the USB devices and, for hubs, whether ports can be powered individually and each
+// port's status. Diagnostic only ("headunit usbinfo"), it changes nothing.
+void hu_usb_print_info()
+{
+  libusb_context* ctx = nullptr;
+  if (libusb_init(&ctx) < 0)
+  {
+    printf("usbinfo: libusb_init failed\n");
+    return;
+  }
+  libusb_device** devices = nullptr;
+  ssize_t count = libusb_get_device_list(ctx, &devices);
+  for (ssize_t i = 0; i < count; i++)
+  {
+    libusb_device_descriptor desc;
+    if (libusb_get_device_descriptor(devices[i], &desc) < 0)
+      continue;
+    printf("device bus %u address %u: %04x:%04x class %u\n",
+           libusb_get_bus_number(devices[i]), libusb_get_device_address(devices[i]),
+           desc.idVendor, desc.idProduct, desc.bDeviceClass);
+    if (desc.bDeviceClass != LIBUSB_CLASS_HUB)
+      continue;
+
+    libusb_device_handle* handle = nullptr;
+    if (libusb_open(devices[i], &handle) < 0)
+    {
+      printf("  hub: cannot open\n");
+      continue;
+    }
+    unsigned char hub_desc[16] = {0};
+    // GET_DESCRIPTOR (hub class): bmRequestType 0xA0, descriptor type 0x29
+    int len = libusb_control_transfer(handle, 0xA0, LIBUSB_REQUEST_GET_DESCRIPTOR, 0x29 << 8, 0,
+                                      hub_desc, sizeof(hub_desc), 1000);
+    if (len >= 5)
+    {
+      int ports = hub_desc[2];
+      int characteristics = hub_desc[3] | (hub_desc[4] << 8);
+      const char* power[] = {"ganged (all ports together)", "individual per port", "none", "none"};
+      printf("  hub: %d ports, power switching: %s\n", ports, power[characteristics & 3]);
+      for (int port = 1; port <= ports; port++)
+      {
+        unsigned char status[4] = {0};
+        // GET_STATUS (port): bmRequestType 0xA3
+        if (libusb_control_transfer(handle, 0xA3, LIBUSB_REQUEST_GET_STATUS, 0, port, status, 4, 1000) == 4)
+        {
+          int s = status[0] | (status[1] << 8);
+          printf("  port %d: %s%s%s\n", port, (s & 0x0001) ? "connected " : "empty ",
+                 (s & 0x0002) ? "enabled " : "", (s & 0x0100) ? "powered" : "not-powered");
+        }
+      }
+    }
+    else
+    {
+      printf("  hub: descriptor read failed (%d)\n", len);
+    }
+    libusb_close(handle);
+  }
+  if (count >= 0)
+    libusb_free_device_list(devices, 1);
+  libusb_exit(ctx);
 }

@@ -69,7 +69,7 @@ void MazdaEventCallbacks::MediaSetupComplete(int chan) {
 
 void MazdaEventCallbacks::DisconnectionOrError() {
     printf("DisconnectionOrError\n");
-    g_main_loop_quit(gst_app.loop);
+    quit_main_loop_async(gst_app.loop);
 }
 
 void MazdaEventCallbacks::CustomizeOutputChannel(int chan, HU::ChannelDescriptor::OutputStreamChannel &streamChannel) {
@@ -675,14 +675,20 @@ void MazdaEventCallbacks::HandleNaviTurn(IHUConnectionThreadInterface& stream, c
 }
 
 void MazdaEventCallbacks::HandleNaviTurnDistance(IHUConnectionThreadInterface& stream, const HU::NAVDistanceMessage &request) {
-  if (!request.has_display_distance_unit()) {
-    logw("NAVDistanceMessage: distance: %d, time: %d, display_distance: %u, display_distance_unit: %d", 
+  // Log whenever the distance shown to the driver changes (AA repeats the message every second)
+  static uint64_t last_display_distance = ~(uint64_t)0;
+  static int last_display_unit = -1;
+  int display_unit = request.has_display_distance_unit() ? request.display_distance_unit() : 0;
+  if (request.display_distance() != last_display_distance || display_unit != last_display_unit) {
+    logw("NAVDistanceMessage: distance: %d, time: %d, display_distance: %llu, display_distance_unit: %d",
         request.distance(),
         request.time_until(),
-        request.display_distance(),
-        request.display_distance_unit()
+        (unsigned long long)request.display_distance(),
+        display_unit
     );
     logUnknownFields(request.unknown_fields());
+    last_display_distance = request.display_distance();
+    last_display_unit = display_unit;
   }
 
   std::lock_guard<std::mutex> lock(hudmutex);

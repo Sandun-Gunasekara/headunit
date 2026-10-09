@@ -12,11 +12,14 @@
 #include "../dbus/generated_cmu.h"
 
 #include "hud_logic.h"
+#include "quit_signal.h"
 
 void hud_start();
 void hud_stop();
 bool hud_installed();
-void hud_thread_func(std::condition_variable& quitcv, std::mutex& quitmutex);
+void hud_thread_func(QuitSignal& quit);
+// Sends one message straight to the HUD (used by the HUD test mode). Returns false if it failed.
+bool hud_send_raw(uint32_t icon, uint16_t distance, uint8_t unit, uint8_t counter, const std::string& text);
 
 // Navigation state shared between the AA thread (writer) and the HUD thread (reader), guarded by hudmutex
 extern NaviData navi_data;
