@@ -45,7 +45,7 @@
 
 
     errno = 0;
-    ret = write (readfd, buf, len);
+    ret = send (readfd, buf, len, MSG_NOSIGNAL);                     // no SIGPIPE if the phone already hung up
     if (ret != len) {             // Write, if can't write full buffer...
       loge ("Error write  errno: %d (%s)", errno, strerror (errno));
       //ms_sleep (101);                                                 // Sleep 0.1 second to try to clear errors
