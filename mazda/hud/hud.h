@@ -5,60 +5,22 @@
 #include <string>
 #include <functional>
 #include <condition_variable>
+#include <mutex>
 #include <dbus/dbus.h>
 #include <dbus-c++/dbus.h>
 
 #include "../dbus/generated_cmu.h"
 
-enum HudDistanceUnit: uint8_t {
-    METERS = 1,
-    MILES = 2,
-    KILOMETERS = 3,
-    YARDS = 4,
-    FEET = 5
-};
-
-struct NaviData {
-  std::string event_name;
-  int32_t turn_side;
-  int32_t turn_event;
-  int32_t turn_number;
-  int32_t turn_angle;
-  int32_t distance; // distance * 10, encoded like that to store one digit after decimal dot in int type
-  HudDistanceUnit distance_unit; 
-  int32_t time_until;
-  uint8_t previous_msg;
-  uint8_t changed;
-};
-
-enum NaviTurns: uint32_t {
-  STRAIGHT = 1,
-  LEFT = 2,
-  RIGHT = 3,
-  SLIGHT_LEFT = 4,
-  SLIGHT_RIGHT = 5,
-  DESTINATION  = 8,
-  DESTINATION_LEFT = 33,
-  DESTINATION_RIGHT = 34,
-  SHARP_LEFT = 11,
-  SHARP_RIGHT = 9,
-  U_TURN_LEFT = 13,
-  U_TURN_RIGHT = 10,
-  FLAG = 12,
-  FLAG_LEFT = 35,
-  FLAG_RIGHT = 36,
-  FORK_LEFT = 15,
-  FORK_RIGHT = 14,
-  MERGE_LEFT = 16,
-  MERGE_RIGHT = 17,
-  OFF_RAMP_LEFT = 7,
-  OFF_RAMP_RIGHT = 30
-};
+#include "hud_logic.h"
 
 void hud_start();
 void hud_stop();
 bool hud_installed();
-void hud_thread_func(std::condition_variable& quitcv, std::mutex& quitmutex, std::mutex& hudmutex);
+void hud_thread_func(std::condition_variable& quitcv, std::mutex& quitmutex);
+
+// Navigation state shared between the AA thread (writer) and the HUD thread (reader), guarded by hudmutex
+extern NaviData navi_data;
+extern std::mutex hudmutex;
 
 class HUDSettingsClient : public com::jci::navi2IHU::HUDSettings_proxy,
                      public DBus::ObjectProxy

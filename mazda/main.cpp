@@ -242,11 +242,10 @@ int main (int argc, char *argv[])
 
             std::condition_variable quitcv;
             std::mutex quitmutex;
-            std::mutex hudmutex;
 
             std::thread nm_thread([&quitcv, &quitmutex](){ nightmode_thread_func(quitcv, quitmutex); } );
             std::thread gp_thread([&quitcv, &quitmutex](){ gps_thread_func(quitcv, quitmutex); } );
-            std::thread hud_thread([&quitcv, &quitmutex, &hudmutex](){ hud_thread_func(quitcv, quitmutex, hudmutex); } );
+            std::thread hud_thread([&quitcv, &quitmutex](){ hud_thread_func(quitcv, quitmutex); } );
 
             /* Start gstreamer pipeline and main loop */
 
