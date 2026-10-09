@@ -3,6 +3,9 @@
 #include "glib_utils.h"
 #include "bt/ub_bluetooth.h"
 #include "config.h"
+#ifdef HUD_SIM
+#include "hud/hud.h"
+#endif
 
 DesktopEventCallbacks::DesktopEventCallbacks() :
     connected(false),
@@ -199,15 +202,31 @@ std::string DesktopCommandServerCallbacks::ChangeParameterConfig(std::string par
 }
 
 void DesktopEventCallbacks::HandleNaviStatus(IHUConnectionThreadInterface& stream, const HU::NAVMessagesStatus &request){
+#ifdef HUD_SIM
+    if (request.status() == HU::NAVMessagesStatus_STATUS_STOP) {
+        std::lock_guard<std::mutex> lock(hudmutex);
+        navi_apply_stop(navi_data);
+    }
+#endif
 }
 
 void DesktopEventCallbacks::HandleNaviTurn(IHUConnectionThreadInterface& stream, const HU::NAVTurnMessage &request){
     const char *event_name = &request.event_name()[0];
     std::string image = request.image();
-    printf(event_name);
+    printf("%s\n", event_name);
     logv ("AA_CH_NAVI: %s, TurnSide: %d, TurnEvent:%d, TurnNumber: %d, TurnAngle: %d", event_name, request.turn_side(), request.turn_event(), request.turn_number(), request.turn_angle());
     hex_dump("AA_CH_NAVI", 256, (unsigned char*)image.c_str(), image.length());
+#ifdef HUD_SIM
+    std::lock_guard<std::mutex> lock(hudmutex);
+    navi_apply_turn(navi_data, request.event_name(), request.turn_side(), request.turn_event(),
+                    request.turn_number(), request.turn_angle());
+#endif
 }
 void DesktopEventCallbacks::HandleNaviTurnDistance(IHUConnectionThreadInterface& stream, const HU::NAVDistanceMessage &request){
     logv ("AA_CH_NAVI: Distance: %d", request.distance());
+#ifdef HUD_SIM
+    std::lock_guard<std::mutex> lock(hudmutex);
+    navi_apply_distance(navi_data, request.distance(), request.time_until(), request.display_distance(),
+                        request.has_display_distance_unit() ? request.display_distance_unit() : 0);
+#endif
 }

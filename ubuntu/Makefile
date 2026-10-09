@@ -24,13 +24,23 @@ SRCS += outputs.cpp
 SRCS += callbacks.cpp
 SRCS += $(TOP)/common/config.cpp
 
+# make HUD_SIM=1: also build the Mazda HUD code, talking to fake CMU dbus services (tools/hud-sim)
+ifdef HUD_SIM
+INCLUDES += $(shell pkg-config --cflags dbus-c++-1 dbus-c++-glib-1) -I$(TOP)/mazda
+LFLAGS += $(shell pkg-config --libs dbus-c++-1 dbus-c++-glib-1)
+CXXFLAGS += -DHUD_SIM
+SRCS += $(TOP)/mazda/hud/hud.cpp
+SRCS += $(TOP)/mazda/hud/hud_logic.cpp
+HUD_SIM_DEPS = $(TOP)/mazda/dbus/generated_cmu.h
+endif
+
 OBJS = $(addsuffix .x64.o, $(basename $(SRCS)))
 DEPS = $(addsuffix .x64.d, $(basename $(SRCS)))
 APP = headunit
 
 .PHONY: clean
 
-all: tag proto $(APP)
+all: tag proto $(HUD_SIM_DEPS) $(APP)
 
 tag:
 	echo "#define HEADUNIT_VERSION \"`git describe --tag`\"" > version.h
@@ -42,6 +52,9 @@ $(APP): $(OBJS)
 
 $(TOP)/hu/generated.x64/hu.pb.cc $(TOP)/hu/generated.x64/hu.pb.h: $(TOP)/hu/hu.proto
 	protoc $< --proto_path=$(TOP)/hu/ --cpp_out=$(TOP)/hu/generated.x64/
+
+$(TOP)/mazda/dbus/generated_cmu.h: $(TOP)/mazda/dbus/cmu_interfaces.xml
+	cd $(TOP)/mazda/dbus && dbusxx-xml2cpp cmu_interfaces.xml --proxy=generated_cmu.h
 
 %.x64.o : %.c
 	$(CX) -MD $(CFLAGS) $(INCLUDES) -c $<  -o $@

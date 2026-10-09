@@ -15,6 +15,14 @@
 #include "callbacks.h"
 
 #include "json/json.hpp"
+#ifdef HUD_SIM
+// Runs the Mazda HUD code against fake CMU dbus services (see tools/hud-sim)
+#include <condition_variable>
+#include <thread>
+#include <dbus-c++/dbus.h>
+#include <dbus-c++/glib-integration.h>
+#include "hud/hud.h"
+#endif
 #include "config.h"
 using json = nlohmann::json;
 
@@ -72,6 +80,12 @@ main(int argc, char *argv[]) {
         errno = 0;
 
         gst_init(NULL, NULL);
+#ifdef HUD_SIM
+        DBus::_init_threading();
+        DBus::Glib::BusDispatcher dbusDispatcher;
+        dbusDispatcher.attach(NULL);
+        DBus::default_dispatcher = &dbusDispatcher;
+#endif
         struct sigaction action;
         sigaction(SIGINT, NULL, &action);
         if (SDL_Init(SDL_INIT_EVERYTHING) != 0) {
@@ -108,6 +122,13 @@ main(int argc, char *argv[]) {
 
             callbacks.connected = true;
 
+#ifdef HUD_SIM
+            hud_start();
+            std::condition_variable hudQuitCv;
+            std::mutex hudQuitMutex;
+            std::thread hudThread([&hudQuitCv, &hudQuitMutex](){ hud_thread_func(hudQuitCv, hudQuitMutex); });
+#endif
+
             g_hu = &headunit.GetAnyThreadInterface();
             commandCallbacks.eventCallbacks = &callbacks;
 
@@ -118,6 +139,10 @@ main(int argc, char *argv[]) {
             }
 
             callbacks.connected = false;
+#ifdef HUD_SIM
+            hudQuitCv.notify_all();
+            hudThread.join();
+#endif
             commandCallbacks.eventCallbacks = nullptr;
 
             /* Stop AA processing */
