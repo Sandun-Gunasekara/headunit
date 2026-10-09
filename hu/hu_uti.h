@@ -91,7 +91,6 @@ void hu_log_library_versions();
 
 void hu_install_crash_handler();
 
-int wait_for_device_connection();
 #ifndef __ANDROID_API__
   #define strlcpy   strncpy
   #define strlcat   strncat

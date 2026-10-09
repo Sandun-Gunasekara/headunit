@@ -3,6 +3,7 @@
 #include <dbus/dbus.h>
 #include <dbus-c++/dbus.h>
 #include <stdint.h>
+#include <string.h>
 #include <string>
 #include <functional>
 #include <condition_variable>
@@ -24,88 +25,140 @@ static HUDSettingsClient *hud_client = NULL;
 static NaviClient *vbsnavi_client = NULL;
 static TMCClient *tmc_client = NULL;
 
-NaviData *navi_data = NULL;
+NaviData navi_data;
 
-uint8_t turns[][3] = {
-  {0,0,0}, //TURN_UNKNOWN
-  {NaviTurns::FLAG_LEFT,NaviTurns::FLAG_RIGHT,NaviTurns::FLAG}, //TURN_DEPART
-  {NaviTurns::STRAIGHT,NaviTurns::STRAIGHT,NaviTurns::STRAIGHT}, //TURN_NAME_CHANGE
-  {NaviTurns::SLIGHT_LEFT,NaviTurns::SLIGHT_RIGHT,NaviTurns::STRAIGHT}, //TURN_SLIGHT_TURN
-  {NaviTurns::LEFT,NaviTurns::RIGHT,0}, //TURN_TURN
-  {NaviTurns::SHARP_LEFT,NaviTurns::SHARP_RIGHT,0}, //TURN_SHARP_TURN
-  {NaviTurns::U_TURN_LEFT, NaviTurns::U_TURN_RIGHT,0}, //TURN_U_TURN
-  {NaviTurns::LEFT,NaviTurns::RIGHT,NaviTurns::STRAIGHT}, //TURN_ON_RAMP
-  {NaviTurns::OFF_RAMP_LEFT,NaviTurns::OFF_RAMP_RIGHT,NaviTurns::STRAIGHT}, //TURN_OFF_RAMP
-  {NaviTurns::FORK_LEFT, NaviTurns::FORK_RIGHT, 0}, //TURN_FORK
-  {NaviTurns::MERGE_LEFT, NaviTurns::MERGE_RIGHT, 0}, //TURN_MERGE
-  {0,0,0},  //TURN_ROUNDABOUT_ENTER
-  {0,0,0}, // TURN_ROUNDABOUT_EXIT
-  {0,0,0}, //TURN_ROUNDABOUT_ENTER_AND_EXIT (Will have to handle seperatly)
-  {NaviTurns::STRAIGHT,NaviTurns::STRAIGHT,NaviTurns::STRAIGHT}, //TURN_STRAIGHT
-  {0,0,0}, //unused?
-  {0,0,0}, //TURN_FERRY_BOAT
-  {0,0,0}, //TURN_FERRY_TRAIN
-  {0,0,0}, //unused??
-  {NaviTurns::DESTINATION_LEFT, NaviTurns::DESTINATION_RIGHT, NaviTurns::DESTINATION} //TURN_DESTINATION
-};
+// Not every CMU firmware has SetHUD_Display_Msg2 (56.00.511 answers UnknownMethod). The arrow and
+// distance from SetHUDDisplayMsgReq work without it, so stop calling it rather than treating every
+// update as failed.
+static bool msg2_supported = true;
 
-uint8_t roundabout(int32_t degrees, int32_t side){
-  uint8_t nearest = (degrees + 15) / 30;
-  uint8_t offset = side == 0 ? 49 : 37;
-  return(nearest + offset);
+bool hud_send_raw(uint32_t icon, uint16_t distance, uint8_t unit, uint8_t counter, const std::string& text)
+{
+  ::DBus::Struct< uint32_t, uint16_t, uint8_t, uint16_t, uint8_t, uint8_t > hudDisplayMsg;
+  hudDisplayMsg._1 = icon;
+  hudDisplayMsg._2 = distance;
+  hudDisplayMsg._3 = unit;
+  hudDisplayMsg._4 = 0; //Speed limit (Not Used)
+  hudDisplayMsg._5 = 0; //Speed limit units (Not used)
+  hudDisplayMsg._6 = counter;
+
+  // Log what the HUD is told whenever it changes (not for counter-only resends)
+  static uint32_t last_icon = 0xFFFFFFFF;
+  static uint16_t last_distance = 0;
+  static uint8_t last_unit = 0;
+  static std::string last_text;
+  if (icon != last_icon || distance != last_distance || unit != last_unit || text != last_text)
+  {
+    logw("HUD: icon %u distance %u unit %u counter %u '%s'", icon, distance, unit, counter, text.c_str());
+    last_icon = icon;
+    last_distance = distance;
+    last_unit = unit;
+    last_text = text;
+  }
+
+  try
+  {
+    vbsnavi_client->SetHUDDisplayMsgReq(hudDisplayMsg);
+  }
+  catch(DBus::Error& error)
+  {
+    loge("DBUS: hud_send failed %s: %s\n", error.name(), error.message());
+    return false;
+  }
+
+  if (msg2_supported)
+  {
+    ::DBus::Struct< std::string, uint8_t > guidancePointData;
+    guidancePointData._1 = text;
+    guidancePointData._2 = counter;
+    try
+    {
+      tmc_client->SetHUD_Display_Msg2(guidancePointData);
+    }
+    catch(DBus::Error& error)
+    {
+      if (strcmp(error.name(), "org.freedesktop.DBus.Error.UnknownMethod") == 0)
+      {
+        logw("HUD: this CMU has no SetHUD_Display_Msg2, street names won't be shown on the HUD");
+        msg2_supported = false;
+      }
+      else
+      {
+        // Only the street name was lost, the arrow and distance were delivered
+        loge("DBUS: SetHUD_Display_Msg2 failed %s: %s\n", error.name(), error.message());
+      }
+    }
+  }
+  return true;
 }
 
-void hud_thread_func(std::condition_variable& quitcv, std::mutex& quitmutex, std::mutex& hudmutex){
-  std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-  //Don't bother with the HUD if we aren't connected via dbus
-  while (hud_installed())
+static bool hud_send(const NaviData& data)
+{
+  return hud_send_raw(hud_turn_icon(data.turn_event, data.turn_side, data.turn_angle), data.distance,
+                      data.distance_unit, data.previous_msg, data.event_name);
+}
+
+void hud_thread_func(QuitSignal& quit){
+  // Keep running for the whole AA session: a failed dbus call or the HUD service not being
+  // ready yet must not stop HUD updates until the phone reconnects.
+  bool was_installed = true;
+  bool showing_guidance = false;
+  while (true)
   {
-    // if (hud_client == NULL) {
-    //   return;
-    // }
-    hudmutex.lock();
-
-    uint32_t diricon;
-    if (navi_data->turn_event == 13) {
-      diricon = roundabout(navi_data->turn_angle, navi_data->turn_side - 1);
-    } else {
-      int32_t turn_side = navi_data->turn_side - 1; //Google starts at 1 for some reason...
-      diricon = turns[navi_data->turn_event][turn_side];
-    }
-
-    ::DBus::Struct< uint32_t, uint16_t, uint8_t, uint16_t, uint8_t, uint8_t > hudDisplayMsg;
-    hudDisplayMsg._1 = diricon;
-    hudDisplayMsg._2 = navi_data->distance;// distance;
-    hudDisplayMsg._3 = navi_data->distance_unit;
-    hudDisplayMsg._4 = 0; //Speed limit (Not Used)
-    hudDisplayMsg._5 = 0; //Speed limit units (Not used)
-    hudDisplayMsg._6 = navi_data->previous_msg;
-
-    ::DBus::Struct< std::string, uint8_t > guidancePointData;
-    guidancePointData._1 = navi_data->event_name;
-    guidancePointData._2 = navi_data->previous_msg;
-
-    if(navi_data->changed){
-      try
-      {
-        vbsnavi_client->SetHUDDisplayMsgReq(hudDisplayMsg);
-        tmc_client->SetHUD_Display_Msg2(guidancePointData);
-      }
-      catch(DBus::Error& error)
-      {
-        loge("DBUS: hud_send failed %s: %s\n", error.name(), error.message());
-        return;
-      }
-	  navi_data->changed = 0;
-    }
-    hudmutex.unlock();
+    if (quit.wait_for(std::chrono::milliseconds(1000)))
     {
-        std::unique_lock<std::mutex> lk(quitmutex);
-        if (quitcv.wait_for(lk, std::chrono::milliseconds(1000)) == std::cv_status::no_timeout)
-        {
-            break;
-        }
+      break;
     }
+
+    bool installed = hud_installed();
+    if (installed != was_installed)
+    {
+      logw("HUD %s", installed ? "available" : "not available, waiting for it");
+      was_installed = installed;
+    }
+    if (!installed)
+    {
+      continue;
+    }
+
+    NaviData snapshot;
+    {
+      std::lock_guard<std::mutex> lock(hudmutex);
+      // Only send changes: the HUD keeps showing the last message until it gets a new one
+      if (!navi_data.changed)
+      {
+        continue;
+      }
+      navi_data.previous_msg = navi_next_msg_id(navi_data.previous_msg);
+      navi_data.changed = false;
+      snapshot = navi_data;
+    }
+
+    // Send outside the lock so a slow dbus call never blocks the AA thread
+    if (hud_send(snapshot))
+    {
+      showing_guidance = snapshot.turn_event != 0 || snapshot.distance != 0;
+    }
+    else
+    {
+      // Try again on the next tick
+      std::lock_guard<std::mutex> lock(hudmutex);
+      navi_data.changed = true;
+    }
+  }
+
+  // Phone disconnected mid route: clear the HUD instead of leaving the last arrow on it
+  if (showing_guidance && hud_installed())
+  {
+    NaviData snapshot;
+    {
+      std::lock_guard<std::mutex> lock(hudmutex);
+      navi_apply_stop(navi_data);
+      navi_data.previous_msg = navi_next_msg_id(navi_data.previous_msg);
+      navi_data.changed = false;
+      snapshot = navi_data;
+    }
+    hud_send(snapshot);
   }
 }
 
@@ -131,7 +184,6 @@ void hud_start()
     return;
   }
   //logv("HUD dbus connections established\n");
-  navi_data = new NaviData();
   return;
 }
 

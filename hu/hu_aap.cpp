@@ -86,7 +86,7 @@
 
       timeval tv_timeout;
       tv_timeout.tv_sec = tmo / 1000;
-      tv_timeout.tv_usec = tmo * 1000;
+      tv_timeout.tv_usec = (tmo % 1000) * 1000;
 
       int ret = select(maxfd+1, &sock_set, NULL, NULL, (tmo > 0) ? &tv_timeout : NULL);
       if (ret < 0)
@@ -107,6 +107,11 @@
     }
 
     ret = read(readfd, buf, len);
+    if (ret == 0) {                                                     // EOF: phone closed the connection
+      loge ("ihu_tra_recv() peer closed connection so stop Transport & AAP");
+      hu_aap_stop ();
+      return (-1);
+    }
     if (ret < 0) {
       loge ("ihu_tra_recv() error so stop Transport & AAP  ret: %d", ret);
       hu_aap_stop ();
@@ -1222,12 +1227,16 @@
                                                                         // Continue only if started or starting...
     if (iaap_state != hu_STATE_STARTED)
       return (0);
+    // Already stopping. Sending the ShutdownRequest below fails if the phone is gone, and a failed
+    // send calls hu_aap_stop() again, which recursed until the stack overflowed.
+    if (hu_thread_quit_flag)
+      return (0);
+    hu_thread_quit_flag = true;
 
     HU::ShutdownRequest shutdownReq;
     shutdownReq.set_reason(HU::ShutdownRequest::REASON_QUIT);
     hu_aap_enc_send_message(0, AA_CH_CTR, HU_PROTOCOL_MESSAGE::ShutdownRequest, shutdownReq);
 
-    hu_thread_quit_flag = true;
     callbacks.DisconnectionOrError();
 
     return (0);
@@ -1386,6 +1395,13 @@
       if (have_len == 0 && !has_first)
       {
         return 0;
+      }
+
+      while (have_len > 0 && have_len < min_size_hdr) {                   // TCP can split the header across reads
+        int got_bytes = hu_aap_tra_recv (&enc_buf[have_len], min_size_hdr - have_len, tmo);
+        if (got_bytes <= 0)
+          break;
+        have_len += got_bytes;
       }
 
       if (have_len < min_size_hdr) {                                      // If we don't have a full 6 byte header at least...

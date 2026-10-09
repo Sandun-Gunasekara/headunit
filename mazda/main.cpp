@@ -27,6 +27,7 @@
 #include "nm/mzd_nightmode.h"
 #include "gps/mzd_gps.h"
 #include "hud/hud.h"
+#include "hu_usb.h"
 
 #include "audio.h"
 #include "main.h"
@@ -34,6 +35,7 @@
 #include "callbacks.h"
 #include "glib_utils.h"
 #include "config.h"
+#include "quit_signal.h"
 
 #define HMI_BUS_ADDRESS "unix:path=/tmp/dbus_hmi_socket"
 #define SERVICE_BUS_ADDRESS "unix:path=/tmp/dbus_service_socket"
@@ -45,14 +47,92 @@ __asm__(".symver realpath1,realpath1@GLIBC_2.11.1");
 gst_app_t gst_app;
 IHUAnyThreadInterface* g_hu = nullptr;
 
-static void nightmode_thread_func(std::condition_variable& quitcv, std::mutex& quitmutex)
+// Prints what a dbus service offers (read only), for the USB test stick:
+// "headunit dbusinfo" lists the services on both CMU buses and introspects the HUD/navi ones.
+static void dbus_call_print(DBusConnection* conn, const char* dest, const char* path, const char* iface, const char* method,
+                            std::vector<std::string>* names = nullptr)
+{
+    DBusMessage* msg = dbus_message_new_method_call(dest, path, iface, method);
+    DBusError err;
+    dbus_error_init(&err);
+    DBusMessage* reply = dbus_connection_send_with_reply_and_block(conn, msg, 3000, &err);
+    dbus_message_unref(msg);
+    printf("=== %s %s %s.%s\n", dest, path, iface, method);
+    if (!reply)
+    {
+        printf("error: %s: %s\n", err.name, err.message);
+        dbus_error_free(&err);
+        return;
+    }
+    DBusMessageIter it;
+    if (dbus_message_iter_init(reply, &it))
+    {
+        if (dbus_message_iter_get_arg_type(&it) == DBUS_TYPE_STRING)
+        {
+            const char* text = nullptr;
+            dbus_message_iter_get_basic(&it, &text);
+            printf("%s\n", text);
+        }
+        else if (dbus_message_iter_get_arg_type(&it) == DBUS_TYPE_ARRAY)
+        {
+            DBusMessageIter sub;
+            dbus_message_iter_recurse(&it, &sub);
+            while (dbus_message_iter_get_arg_type(&sub) == DBUS_TYPE_STRING)
+            {
+                const char* name = nullptr;
+                dbus_message_iter_get_basic(&sub, &name);
+                printf("%s\n", name);
+                if (names)
+                    names->push_back(name);
+                dbus_message_iter_next(&sub);
+            }
+        }
+    }
+    dbus_message_unref(reply);
+}
+
+static void dbus_print_info()
+{
+    struct { const char* address; const char* label; } buses[] = {
+        { SERVICE_BUS_ADDRESS, "service bus" }, { HMI_BUS_ADDRESS, "hmi bus" } };
+    for (auto& bus : buses)
+    {
+        DBusError err;
+        dbus_error_init(&err);
+        DBusConnection* conn = dbus_connection_open_private(bus.address, &err);
+        if (!conn || !dbus_bus_register(conn, &err))
+        {
+            printf("=== %s: cannot connect: %s\n", bus.label, err.message ? err.message : "?");
+            dbus_error_free(&err);
+            continue;
+        }
+        printf("##### %s (%s)\n", bus.label, bus.address);
+        std::vector<std::string> names;
+        dbus_call_print(conn, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "ListNames", &names);
+        // Introspect everything navigation/HUD related; CMU services use the name as the object path
+        for (const std::string& name : names)
+        {
+            std::string lower = name;
+            std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+            if (name[0] == ':' || (lower.find("nav") == std::string::npos && lower.find("hud") == std::string::npos))
+                continue;
+            std::string path = "/" + name;
+            std::replace(path.begin(), path.end(), '.', '/');
+            dbus_call_print(conn, name.c_str(), path.c_str(), "org.freedesktop.DBus.Introspectable", "Introspect");
+        }
+        dbus_connection_close(conn);
+        dbus_connection_unref(conn);
+    }
+}
+
+static void nightmode_thread_func(QuitSignal& quit)
 {
     int nightmode = NM_NO_VALUE;
     mzd_nightmode_start();
     //Offset so the GPS and NM thread are not perfectly in sync testing each second
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    bool quitting = quit.wait_for(std::chrono::milliseconds(500));
 
-    while (true)
+    while (!quitting)
     {
         int nightmodenow = mzd_is_night_mode_set();
 
@@ -71,19 +151,13 @@ static void nightmode_thread_func(std::condition_variable& quitcv, std::mutex& q
             });
         }
 
-        {
-            std::unique_lock<std::mutex> lk(quitmutex);
-            if (quitcv.wait_for(lk, std::chrono::milliseconds(1000)) == std::cv_status::no_timeout)
-            {
-                break;
-            }
-        }
+        quitting = quit.wait_for(std::chrono::milliseconds(1000));
     }
 
     mzd_nightmode_stop();
 }
 
-static void gps_thread_func(std::condition_variable& quitcv, std::mutex& quitmutex)
+static void gps_thread_func(QuitSignal& quit)
 {
     GPSData data, newData;
     uint64_t oldTs = 0;
@@ -152,13 +226,10 @@ static void gps_thread_func(std::condition_variable& quitcv, std::mutex& quitmut
             });
         }
 
+        //The timestamps on the GPS events are in seconds, but based on logging the data actually changes faster with the same timestamp
+        if (quit.wait_for(std::chrono::milliseconds(250)))
         {
-            std::unique_lock<std::mutex> lk(quitmutex);
-            //The timestamps on the GPS events are in seconds, but based on logging the data actually changes faster with the same timestamp
-            if (quitcv.wait_for(lk, std::chrono::milliseconds(250)) == std::cv_status::no_timeout)
-            {
-                break;
-            }
+            break;
         }
     }
 
@@ -184,6 +255,60 @@ int main (int argc, char *argv[])
     DBus::_init_threading();
 
     gst_init(&argc, &argv);
+
+    // Diagnostics for the USB test stick
+    if (argc >= 2 && strcmp(argv[1], "usbinfo") == 0)
+    {
+        hu_usb_print_info();
+        return 0;
+    }
+    if (argc >= 2 && strcmp(argv[1], "dbusinfo") == 0)
+    {
+        dbus_print_info();
+        return 0;
+    }
+    // headunit hudtest <icon> <distance> <unit> <counter> [text] [hold seconds] [resend 0|1]:
+    // send a message to the HUD, then keep the connection open for <hold seconds>, resending it
+    // every second if <resend> is 1 (like a running AA session)
+    if (argc >= 6 && strcmp(argv[1], "hudtest") == 0)
+    {
+        try
+        {
+            DBus::BusDispatcher dispatcher;
+            DBus::default_dispatcher = &dispatcher;
+            hud_start();
+            printf("HUDTEST: hud installed %d\n", hud_installed() ? 1 : 0);
+            uint32_t icon = strtoul(argv[2], nullptr, 10);
+            uint16_t distance = strtoul(argv[3], nullptr, 10);
+            uint8_t unit = strtoul(argv[4], nullptr, 10);
+            uint8_t counter = strtoul(argv[5], nullptr, 10);
+            std::string text = argc >= 7 ? argv[6] : "";
+            int hold = argc >= 8 ? atoi(argv[7]) : 0;
+            bool resend = argc >= 9 && atoi(argv[8]) == 1;
+            bool ok = hud_send_raw(icon, distance, unit, counter, text);
+            printf("HUDTEST: %s\n", ok ? "SENT" : "FAILED");
+            int sends = 1, failures = ok ? 0 : 1;
+            for (int second = 0; second < hold; second++)
+            {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (resend)
+                {
+                    counter = counter % 7 + 1;
+                    if (!hud_send_raw(icon, distance, unit, counter, text))
+                        failures++;
+                    sends++;
+                }
+            }
+            printf("HUDTEST: held %d s, %d sends, %d failed\n", hold, sends, failures);
+            hud_stop();
+            DBus::default_dispatcher = nullptr;
+        }
+        catch(DBus::Error& error)
+        {
+            printf("HUDTEST: dbus error %s: %s\n", error.name(), error.message());
+        }
+        return 0;
+    }
 
     try
     {
@@ -230,23 +355,31 @@ int main (int argc, char *argv[])
             g_hu = &headunit.GetAnyThreadInterface();
             commandCallbacks.eventCallbacks = &callbacks;
 
+            // Create the loop before connecting: the phone can disconnect as soon as the AA thread
+            // starts, and DisconnectionOrError() must be able to quit the loop from then on.
+            gst_app.loop = g_main_loop_new(run_on_thread_main_context, FALSE);
+
             //Wait forever for a connection
             int ret = headunit.hu_aap_start(config::transport_type, config::phoneIpAddress, true);
             if (ret < 0) {
                 loge("Something bad happened");
+                commandCallbacks.eventCallbacks = nullptr;
+                g_hu = nullptr;
+                g_main_loop_unref(gst_app.loop);
+                gst_app.loop = nullptr;
+                g_main_context_unref(run_on_thread_main_context);
+                run_on_thread_main_context = nullptr;
+                DBus::default_dispatcher = nullptr;
                 continue;
             }
 
-            gst_app.loop = g_main_loop_new(run_on_thread_main_context, FALSE);
             callbacks.connected = true;
 
-            std::condition_variable quitcv;
-            std::mutex quitmutex;
-            std::mutex hudmutex;
+            QuitSignal quit;
 
-            std::thread nm_thread([&quitcv, &quitmutex](){ nightmode_thread_func(quitcv, quitmutex); } );
-            std::thread gp_thread([&quitcv, &quitmutex](){ gps_thread_func(quitcv, quitmutex); } );
-            std::thread hud_thread([&quitcv, &quitmutex, &hudmutex](){ hud_thread_func(quitcv, quitmutex, hudmutex); } );
+            std::thread nm_thread([&quit](){ nightmode_thread_func(quit); } );
+            std::thread gp_thread([&quit](){ gps_thread_func(quit); } );
+            std::thread hud_thread([&quit](){ hud_thread_func(quit); } );
 
             /* Start gstreamer pipeline and main loop */
 
@@ -263,7 +396,7 @@ int main (int argc, char *argv[])
 
             printf("quitting...\n");
             //wake up night mode  and gps polling threads
-            quitcv.notify_all();
+            quit.request();
 
             printf("waiting for nm_thread\n");
             nm_thread.join();

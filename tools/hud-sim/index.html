@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HUD Simulator</title>
+<style>
+  :root { --bg:#f4f5f7; --panel:#fff; --text:#1d2330; --muted:#677084; --line:#dde1e8;
+          --hud:#0b0f0c; --hudtext:#e9fff1; --ok:#1a7f4b; --warn:#b26b00; --bad:#c0392b; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#111418; --panel:#1a1f26; --text:#e6e9ef; --muted:#97a0b2; --line:#2b323d; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 system-ui, sans-serif; }
+  main { max-width:1100px; margin:0 auto; padding:20px 16px 40px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 18px; }
+  .grid { display:grid; grid-template-columns:minmax(0,3fr) minmax(0,2fr); gap:16px; }
+  @media (max-width:800px) { .grid { grid-template-columns:1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  .panel h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:0 0 12px; }
+  .hud { background:var(--hud); color:var(--hudtext); border-radius:8px; padding:18px; min-height:150px;
+         display:flex; flex-direction:column; align-items:center; justify-content:center; gap:6px; text-align:center;
+         text-shadow:0 0 6px rgba(160,255,200,.45); font-family:ui-monospace, Menlo, monospace; }
+  .hud .text { font-size:15px; min-height:20px; }
+  .hud .row { display:flex; align-items:baseline; gap:22px; }
+  .hud .dist { font-size:34px; font-weight:700; }
+  .hud .icon { font-size:18px; }
+  .hud.stale { outline:2px solid var(--warn); }
+  .meta { display:grid; grid-template-columns:auto 1fr; gap:4px 14px; margin-top:12px; color:var(--muted); }
+  .meta b { color:var(--text); font-weight:600; }
+  .photo { margin-top:12px; }
+  .photo img { width:100%; border-radius:6px; display:block; }
+  .photo p { color:var(--muted); font-size:12px; margin:6px 0 0; }
+  .controls label { display:flex; align-items:center; gap:8px; margin:0 0 10px; }
+  .controls .btns { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; }
+  button { font:inherit; padding:6px 12px; border-radius:6px; border:1px solid var(--line); background:var(--bg); color:var(--text); cursor:pointer; }
+  button:hover { border-color:var(--muted); }
+  .stats { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
+  .stat { border:1px solid var(--line); border-radius:8px; padding:8px; }
+  .stat .n { font-size:20px; font-weight:700; font-variant-numeric:tabular-nums; }
+  .stat .l { color:var(--muted); font-size:12px; }
+  .log { margin-top:16px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  td { padding:4px 6px; border-top:1px solid var(--line); vertical-align:top; overflow-wrap:anywhere; }
+  td.k { white-space:nowrap; font-weight:600; }
+  .k-FAILED { color:var(--bad); } .k-IGNORED { color:var(--warn); } .k-control { color:var(--muted); }
+  .k-display, .k-text { color:var(--ok); }
+  .status { font-weight:600; } .status.bad { color:var(--bad); } .status.ok { color:var(--ok); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Mazda HUD simulator</h1>
+  <p class="sub">Shows what the headunit sends to the car's HUD over dbus. Connection: <span id="conn" class="status">…</span></p>
+
+  <div class="grid">
+    <section class="panel">
+      <h2>HUD display</h2>
+      <div class="hud" id="hud">
+        <div class="text" id="text"></div>
+        <div class="row"><span class="dist" id="dist"></span><span class="icon" id="icon"></span></div>
+      </div>
+      <div class="meta">
+        <span>Icon code</span><b id="code"></b>
+        <span>Message counter</span><b id="counter"></b>
+        <span>Last accepted update</span><b id="updated"></b>
+        <span>Last call from headunit</span><b id="since"></b>
+      </div>
+      <div class="photo" id="photo">
+        <img id="photoimg" alt="">
+        <p>Reference photo of a real Mazda HUD showing this icon code (taken with test text "DIRICON n" and a fixed 100 m).</p>
+      </div>
+    </section>
+
+    <section class="panel controls">
+      <h2>Simulate car conditions</h2>
+      <label><input type="checkbox" id="installed"> HUD service reports installed</label>
+      <label><input type="checkbox" id="ignore"> HUD ignores a message that repeats the last counter</label>
+      <label><input type="checkbox" id="msg2"> Firmware has SetHUD_Display_Msg2 (street names; 56.00.511 doesn't)</label>
+      <div class="btns">
+        <button data-fail="1">Fail next HUD call</button>
+        <button data-fail="5">Fail next 5 calls</button>
+        <button id="clear">Clear log</button>
+      </div>
+      <div class="stats">
+        <div class="stat"><div class="n" id="s-display">0</div><div class="l">display calls</div></div>
+        <div class="stat"><div class="n" id="s-ignored">0</div><div class="l">ignored (same counter)</div></div>
+        <div class="stat"><div class="n" id="s-failed">0</div><div class="l">failed (injected)</div></div>
+      </div>
+      <p class="sub" style="margin-top:10px">Pending injected failures: <b id="pending">0</b></p>
+    </section>
+  </div>
+
+  <section class="panel log">
+    <h2>Messages from headunit (newest first)</h2>
+    <table><tbody id="log"></tbody></table>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let lastPhoto = null;
+
+async function control(body) {
+  try {
+    const r = await fetch('/control', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    render(await r.json());
+  } catch (e) {}
+}
+
+function render(s) {
+  const d = s.display;
+  $('text').textContent = d.text;
+  $('dist').textContent = d.icon || d.distance ? d.distance_text : '';
+  $('icon').textContent = d.icon ? d.icon_name : '(no navigation)';
+  $('code').textContent = d.icon + ' — ' + d.icon_name;
+  $('counter').textContent = d.counter;
+  $('updated').textContent = d.updated || 'never';
+  $('since').textContent = s.seconds_since_call === null ? 'never' : s.seconds_since_call + ' s ago';
+  $('hud').classList.toggle('stale', s.seconds_since_call !== null && s.seconds_since_call > 5);
+  $('installed').checked = s.installed;
+  $('ignore').checked = s.ignore_same_counter;
+  $('msg2').checked = s.msg2_supported;
+  $('pending').textContent = s.fail_next;
+  $('s-display').textContent = s.stats.display_calls;
+  $('s-ignored').textContent = s.stats.ignored;
+  $('s-failed').textContent = s.stats.failed;
+
+  const photo = d.has_photo ? '/icons/' + String(d.icon).padStart(4, '0') + '.jpg' : null;
+  $('photo').style.display = photo ? '' : 'none';
+  if (photo && photo !== lastPhoto) { $('photoimg').src = photo; lastPhoto = photo; }
+
+  const rows = s.log.map(e => {
+    const tr = document.createElement('tr');
+    for (const [cls, val] of [['', e.time], ['k k-' + e.kind, e.kind], ['', e.detail]]) {
+      const td = document.createElement('td');
+      td.className = cls; td.textContent = val; tr.appendChild(td);
+    }
+    return tr;
+  });
+  $('log').replaceChildren(...rows);
+}
+
+async function poll() {
+  try {
+    const r = await fetch('/state');
+    render(await r.json());
+    $('conn').textContent = 'simulator running'; $('conn').className = 'status ok';
+  } catch (e) {
+    $('conn').textContent = 'simulator not reachable'; $('conn').className = 'status bad';
+  }
+  setTimeout(poll, 500);
+}
+
+$('installed').onchange = e => control({installed: e.target.checked});
+$('ignore').onchange = e => control({ignore_same_counter: e.target.checked});
+$('msg2').onchange = e => control({msg2_supported: e.target.checked});
+$('clear').onclick = () => control({clear_log: true});
+document.querySelectorAll('[data-fail]').forEach(b => b.onclick = () => control({fail_next: Number(b.dataset.fail)}));
+poll();
+</script>
+</body>
+</html>

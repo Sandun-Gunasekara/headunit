@@ -15,6 +15,14 @@
 #include "callbacks.h"
 
 #include "json/json.hpp"
+#ifdef HUD_SIM
+// Runs the Mazda HUD code against fake CMU dbus services (see tools/hud-sim)
+#include <condition_variable>
+#include <thread>
+#include <dbus-c++/dbus.h>
+#include <dbus-c++/glib-integration.h>
+#include "hud/hud.h"
+#endif
 #include "config.h"
 using json = nlohmann::json;
 
@@ -38,7 +46,6 @@ gst_loop(gst_app_t *app) {
         int ret;
         GstStateChangeReturn state_ret;
 
-        app->loop = g_main_loop_new(NULL, FALSE);
         printf("Starting Android Auto...\n");
         g_main_loop_run(app->loop);
 
@@ -72,6 +79,12 @@ main(int argc, char *argv[]) {
         errno = 0;
 
         gst_init(NULL, NULL);
+#ifdef HUD_SIM
+        DBus::_init_threading();
+        DBus::Glib::BusDispatcher dbusDispatcher;
+        dbusDispatcher.attach(NULL);
+        DBus::default_dispatcher = &dbusDispatcher;
+#endif
         struct sigaction action;
         sigaction(SIGINT, NULL, &action);
         if (SDL_Init(SDL_INIT_EVERYTHING) != 0) {
@@ -99,6 +112,9 @@ main(int argc, char *argv[]) {
             DesktopEventCallbacks callbacks;
             HUServer headunit(callbacks);
 
+            // Create the loop before connecting so an early disconnect can quit it
+            app->loop = g_main_loop_new(NULL, FALSE);
+
             /* Start AA processing */
             ret = headunit.hu_aap_start(config::transport_type, config::phoneIpAddress, true);
             if (ret < 0) {
@@ -107,6 +123,12 @@ main(int argc, char *argv[]) {
             }
 
             callbacks.connected = true;
+
+#ifdef HUD_SIM
+            hud_start();
+            QuitSignal hudQuit;
+            std::thread hudThread([&hudQuit](){ hud_thread_func(hudQuit); });
+#endif
 
             g_hu = &headunit.GetAnyThreadInterface();
             commandCallbacks.eventCallbacks = &callbacks;
@@ -118,6 +140,10 @@ main(int argc, char *argv[]) {
             }
 
             callbacks.connected = false;
+#ifdef HUD_SIM
+            hudQuit.request();
+            hudThread.join();
+#endif
             commandCallbacks.eventCallbacks = nullptr;
 
             /* Stop AA processing */
@@ -129,6 +155,8 @@ main(int argc, char *argv[]) {
             }
 
             g_hu = nullptr;
+            g_main_loop_unref(app->loop);
+            app->loop = nullptr;
         }
 
         SDL_Quit();

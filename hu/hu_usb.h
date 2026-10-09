@@ -8,6 +8,8 @@
 
 const char* iusb_error_get(int error);
 
+void hu_usb_print_info();
+
 class HUTransportStreamUSB : public HUTransportStream
 {
     HU_STATE isub_state = hu_STATE_INITIAL;
@@ -44,6 +46,7 @@ class HUTransportStreamUSB : public HUTransportStream
     static void libusb_callback_pollfd_removed_tramp(int fd, void* user_data);
 
     libusb_device_handle* find_oap_device();
+    bool switch_to_accessory_mode(libusb_device* device, bool verbose);
 public:
     ~HUTransportStreamUSB();
     HUTransportStreamUSB();
